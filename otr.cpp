@@ -39,15 +39,17 @@ GCRY_THREAD_OPTION_PTHREAD_IMPL;
 #include <cstring>
 #include <iostream>
 #include <list>
+#include <map>
+#include <regex>
 
 using std::list;
+using std::map;
 
 #define PROTOCOL_ID "irc"
 
 class COtrGenKeyJob : public CModuleJob {
   public:
-    COtrGenKeyJob(CModule* pModule)
-        : CModuleJob(pModule, "OtrGenKey", "OTR key generator") {}
+    COtrGenKeyJob(CModule* pModule) : CModuleJob(pModule, "OtrGenKey", "OTR key generator") {}
 
     void runThread() override;
     void runMain() override;
@@ -55,9 +57,7 @@ class COtrGenKeyJob : public CModuleJob {
 
 class COtrTimer : public CTimer {
   public:
-    COtrTimer(CModule* pModule, unsigned int uInterval)
-        : CTimer(pModule, uInterval, /*run forever*/ 0, "OtrTimer",
-                 "OTR message poll") {}
+    COtrTimer(CModule* pModule, unsigned int uInterval) : CTimer(pModule, uInterval, /*run forever*/ 0, "OtrTimer", "OTR message poll") {}
 
   protected:
     void RunJob() override;
@@ -87,8 +87,12 @@ class COtrMod : public CModule {
     CString m_sFPPath;
     CString m_sInsTagPath;
     list<CString> m_Buffer;
+    VCString m_vsEnabled;
     VCString m_vsIgnored;
     COtrTimer* m_pOtrTimer;
+
+    // per-sender buffer of received partial OTR messages
+    map<CString, CString> m_MessageBuffer;
 
     // m_GenKeyRunning acts as a lock for members following it. We don't need
     // an actual lock because it is accessed only from the main thread.
@@ -120,9 +124,9 @@ class COtrMod : public CModule {
 
     static CString Clr(Color eClr, const CString& sWhat) {
         if (eClr == Bold) {
-            return "\x02" + sWhat + "\x02";
+            return CString("\x02") + sWhat + "\x02";
         } else {
-            return "\x03" + eClr + sWhat + "\x03";
+            return CString("\x03") + (char)eClr + sWhat + "\x03";
         }
     }
 
@@ -135,19 +139,16 @@ class COtrMod : public CModule {
     CString OurFingerprint() {
         char ourfp[OTRL_PRIVKEY_FPRINT_HUMAN_LEN];
         CString accountname = GetUser()->GetUserName();
-        if (otrl_privkey_fingerprint(m_pUserState, ourfp, accountname.c_str(),
-                                     PROTOCOL_ID)) {
+        if (otrl_privkey_fingerprint(m_pUserState, ourfp, accountname.c_str(), PROTOCOL_ID)) {
             return ourfp;
         }
         return "ERROR";
     }
 
     void WriteFingerprints() {
-        gcry_error_t err = otrl_privkey_write_fingerprints(m_pUserState,
-                                                           m_sFPPath.c_str());
+        gcry_error_t err = otrl_privkey_write_fingerprints(m_pUserState, m_sFPPath.c_str());
         if (err) {
-            PutModuleBuffered(CString("Failed to write fingerprints: ") +
-                              gcry_strerror(err));
+            PutModuleBuffered(CString("Failed to write fingerprints: ") + gcry_strerror(err));
         }
     }
 
@@ -157,8 +158,7 @@ class COtrMod : public CModule {
         bool bNetworkMod = GetNetwork()->GetModules().FindModule("log");
 
         if (bUserMod || bNetworkMod) {
-            CString sMsg =
-                Clr(Red, "WARNING:") + " The log module is loaded. Type ";
+            CString sMsg = Clr(Red, "WARNING:") + " The log module is loaded. Type ";
             if (bUserMod) {
                 sMsg += Clr(Bold, "/msg *status UnloadMod log") + " ";
                 if (bNetworkMod) {
@@ -166,8 +166,7 @@ class COtrMod : public CModule {
                 }
             }
             if (bNetworkMod) {
-                sMsg += Clr(Bold, "/msg *status UnloadMod --type=network log") +
-                        " ";
+                sMsg += Clr(Bold, "/msg *status UnloadMod --type=network log") + " ";
             }
             sMsg += "to prevent ZNC from logging the conversation to disk.";
             PutModuleBuffered(sMsg);
@@ -192,9 +191,7 @@ class COtrMod : public CModule {
             // one we
             // send our messages to.
             assert(ctx->username);
-            ConnContext* best_ctx = otrl_context_find(
-                m_pUserState, ctx->username, GetUser()->GetUserName().c_str(),
-                PROTOCOL_ID, OTRL_INSTAG_BEST, 0, nullptr, nullptr, nullptr);
+            ConnContext* best_ctx = otrl_context_find(m_pUserState, ctx->username, GetUser()->GetUserName().c_str(), PROTOCOL_ID, OTRL_INSTAG_BEST, 0, nullptr, nullptr, nullptr);
             if (!best_ctx) continue;
 
             CString state;
@@ -244,20 +241,16 @@ class COtrMod : public CModule {
         PutModule("Your fingerprint: " + OurFingerprint() + ".");
     }
 
-    ConnContext* GetContextFromArg(const CString& sLine,
-                                   bool bWarnIfNotFound = true) {
+    ConnContext* GetContextFromArg(const CString& sLine, bool bWarnIfNotFound = true) {
         CString sNick = sLine.Token(1).MakeLower();
-        ConnContext* ctx = otrl_context_find(
-            m_pUserState, sNick.c_str(), GetUser()->GetUserName().c_str(),
-            PROTOCOL_ID, OTRL_INSTAG_BEST, 0, NULL, NULL, NULL);
+        ConnContext* ctx = otrl_context_find(m_pUserState, sNick.c_str(), GetUser()->GetUserName().c_str(), PROTOCOL_ID, OTRL_INSTAG_BEST, 0, NULL, NULL, NULL);
         if (!ctx && bWarnIfNotFound) {
             PutModuleBuffered("Context for nick '" + sNick + "' not found.");
         }
         return ctx;
     }
 
-    bool GetFprintFromArg(const CString& sLine, ConnContext*& ctx,
-                          Fingerprint*& fprint) {
+    bool GetFprintFromArg(const CString& sLine, ConnContext*& ctx, Fingerprint*& fprint) {
         fprint = NULL;
         // Try interpreting the argument as a nick and if we don't find a
         // context, interpret
@@ -274,8 +267,7 @@ class COtrMod : public CModule {
 
             for (ConnContext* curctx = m_pUserState->context_root; curctx;
                  curctx = curctx->next) {
-                for (Fingerprint* curfp = curctx->fingerprint_root.next; curfp;
-                     curfp = curfp->next) {
+                for (Fingerprint* curfp = curctx->fingerprint_root.next; curfp; curfp = curfp->next) {
                     CString sCtxFP = HumanFingerprint(curfp).Replace_n(" ", "");
                     if (sCtxFP.Equals(sNormalizedFP, false)) {
                         fprint = curfp;
@@ -285,9 +277,7 @@ class COtrMod : public CModule {
             }
         }
         if (!fprint) {
-            PutModuleBuffered(
-                "Fingerprint not found. This comand takes either nick "
-                "or hexadecimal fingerprint as an argument.");
+            PutModuleBuffered("Fingerprint not found. This comand takes either nick or hexadecimal fingerprint as an argument.");
             return false;
         }
         return true;
@@ -302,13 +292,10 @@ class COtrMod : public CModule {
 
         int already_trusted = otrl_context_is_fingerprint_trusted(fprint);
         if (already_trusted) {
-            PutModuleContext(ctx, CString("Fingerprint ") +
-                                      HumanFingerprint(fprint) +
-                                      " already trusted.");
+            PutModuleContext(ctx, CString("Fingerprint ") + HumanFingerprint(fprint) + " already trusted.");
         } else {
             otrl_context_set_trust(fprint, "manual");
-            PutModuleContext(ctx, CString("Fingerprint ") +
-                                      HumanFingerprint(fprint) + " trusted!");
+            PutModuleContext(ctx, CString("Fingerprint ") + HumanFingerprint(fprint) + " trusted!");
             WriteFingerprints();
         }
     }
@@ -322,31 +309,23 @@ class COtrMod : public CModule {
 
         int trusted = otrl_context_is_fingerprint_trusted(fprint);
         if (!trusted) {
-            PutModuleContext(ctx, CString("Already not trusting ") +
-                                      HumanFingerprint(fprint) + ".");
+            PutModuleContext(ctx, CString("Already not trusting ") + HumanFingerprint(fprint) + ".");
         } else {
             otrl_context_set_trust(fprint, "");
-            PutModuleContext(ctx, CString("Fingerprint ") +
-                                      HumanFingerprint(fprint) +
-                                      " distrusted!");
+            PutModuleContext(ctx, CString("Fingerprint ") + HumanFingerprint(fprint) + " distrusted!");
             WriteFingerprints();
         }
     }
 
     void CmdFinish(const CString& sLine) {
         ConnContext* ctx = GetContextFromArg(sLine);
-        if (!ctx) {
-            return;
-        }
+        if (!ctx) { return; }
 
-        otrl_message_disconnect(m_pUserState, &m_xOtrOps, this,
-                                ctx->accountname, PROTOCOL_ID, ctx->username,
-                                ctx->their_instance);
+        otrl_message_disconnect(m_pUserState, &m_xOtrOps, this, ctx->accountname, PROTOCOL_ID, ctx->username, ctx->their_instance);
         PutModuleContext(ctx, "Conversation finished.");
     }
 
-    void DoSMP(ConnContext* ctx, const CString& sQuestion,
-               const CString& sSecret) {
+    void DoSMP(ConnContext* ctx, const CString& sQuestion, const CString& sSecret) {
         if (sSecret.empty()) {
             PutModuleContext(ctx, "No secret given!");
             return;
@@ -361,22 +340,13 @@ class COtrMod : public CModule {
         assert(ad);
 
         if (ad->bSmpReply) {
-            otrl_message_respond_smp(
-                m_pUserState, &m_xOtrOps, this, ctx,
-                reinterpret_cast<const unsigned char*>(sSecret.c_str()),
-                sSecret.length());
+            otrl_message_respond_smp(m_pUserState, &m_xOtrOps, this, ctx, reinterpret_cast<const unsigned char*>(sSecret.c_str()), sSecret.length());
             PutModuleContext(ctx, "Responded to authentication.");
         } else {
             if (sQuestion.empty()) {
-                otrl_message_initiate_smp(
-                    m_pUserState, &m_xOtrOps, this, ctx,
-                    reinterpret_cast<const unsigned char*>(sSecret.c_str()),
-                    sSecret.length());
+                otrl_message_initiate_smp(m_pUserState, &m_xOtrOps, this, ctx, reinterpret_cast<const unsigned char*>(sSecret.c_str()), sSecret.length());
             } else {
-                otrl_message_initiate_smp_q(
-                    m_pUserState, &m_xOtrOps, this, ctx, sQuestion.c_str(),
-                    reinterpret_cast<const unsigned char*>(sSecret.c_str()),
-                    sSecret.length());
+                otrl_message_initiate_smp_q(m_pUserState, &m_xOtrOps, this, ctx, sQuestion.c_str(), reinterpret_cast<const unsigned char*>(sSecret.c_str()), sSecret.length());
             }
             PutModuleContext(ctx, "Initiated authentication.");
         }
@@ -386,9 +356,7 @@ class COtrMod : public CModule {
 
     void CmdAuth(const CString& sLine) {
         ConnContext* ctx = GetContextFromArg(sLine);
-        if (!ctx) {
-            return;
-        }
+        if (!ctx) { return; }
 
         CString sSecret = sLine.Token(2, true);
         DoSMP(ctx, "", sSecret);
@@ -396,24 +364,18 @@ class COtrMod : public CModule {
 
     void CmdAuthQ(const CString& sLine) {
         ConnContext* ctx = GetContextFromArg(sLine);
-        if (!ctx) {
-            return;
-        }
+        if (!ctx) { return; }
 
         COtrAppData* ad = static_cast<COtrAppData*>(ctx->app_data);
         assert(ad);
         if (ad->bSmpReply) {
-            PutModuleContext(ctx,
-                             "Authentication in progress. Use Auth to "
-                             "respond with secret, or AuthAbort to abort it");
+            PutModuleContext(ctx, "Authentication in progress. Use Auth to respond with secret, or AuthAbort to abort it");
             return;
         }
 
         CString sRest = sLine.Token(2, true);
         if (sRest.length() == 0 || sRest[0] != '[') {
-            PutModuleContext(ctx,
-                             "No question found. Did you enclose it in "
-                             "square brackets?");
+            PutModuleContext(ctx, "No question found. Did you enclose it in square brackets?");
             return;
         }
 
@@ -437,9 +399,7 @@ class COtrMod : public CModule {
 
     void CmdAuthAbort(const CString& sLine) {
         ConnContext* ctx = GetContextFromArg(sLine);
-        if (!ctx) {
-            return;
-        }
+        if (!ctx) { return; }
 
         COtrAppData* ad = static_cast<COtrAppData*>(ctx->app_data);
         assert(ad);
@@ -453,33 +413,19 @@ class COtrMod : public CModule {
         assert(m_pUserState);
         const char* accountname = GetUser()->GetUserName().c_str();
 
-        bool bHasKey =
-            otrl_privkey_find(m_pUserState, accountname, PROTOCOL_ID);
+        bool bHasKey = otrl_privkey_find(m_pUserState, accountname, PROTOCOL_ID);
         bool bOverwrite = sLine.Token(1).Equals("--overwrite");
         bool bReally = sLine.Token(1).Equals("--really");
 
         if (bHasKey && !bOverwrite) {
-            PutModuleBuffered("Private key already exists. Use " +
-                              Clr(Bold, "genkey --overwrite") +
-                              " to overwrite the old one.");
+            PutModuleBuffered("Private key already exists. Use " + Clr(Bold, "genkey --overwrite") + " to overwrite the old one.");
             return;
         }
 
         if (!bHasKey && !bReally) {
-            PutModuleBuffered(Clr(Red, "WARNING:") +
-                              " This plugin does not provide true end-to-end "
-                              "encryption, as the encryption terminates at "
-                              "the bouncer. You need to make sure that both "
-                              "the bouncer and your client's connection to "
-                              "it are secure.");
-            PutModuleBuffered(Clr(Bold, "NOTE:") +
-                              " If you're running this plugin on a VM, make "
-                              "sure it has sufficient entropy, otherwise ZNC "
-                              "might get stuck. Install haveged to increase "
-                              "available entropy.");
-            PutModuleBuffered(
-                "If you still want to generate new OTR key, type " +
-                Clr(Bold, "genkey --really") + ".");
+            PutModuleBuffered(Clr(Red, "WARNING:") + " This plugin does not provide true end-to-end encryption, as the encryption terminates at the bouncer. You need to make sure that both the bouncer and your client's connection to it are secure.");
+            PutModuleBuffered(Clr(Bold, "NOTE:") + " If you're running this plugin on a VM, make sure it has sufficient entropy, otherwise ZNC might get stuck. Install haveged to increase available entropy.");
+            PutModuleBuffered("If you still want to generate new OTR key, type " + Clr(Bold, "genkey --really") + ".");
             return;
         }
 
@@ -488,11 +434,9 @@ class COtrMod : public CModule {
             return;
         }
 
-        gcry_error_t err = otrl_privkey_generate_start(
-            m_pUserState, accountname, PROTOCOL_ID, &m_NewKey);
+        gcry_error_t err = otrl_privkey_generate_start(m_pUserState, accountname, PROTOCOL_ID, &m_NewKey);
         if (err) {
-            PutModuleBuffered(CString("Key generation failed: ") +
-                              gcry_strerror(err));
+            PutModuleBuffered(CString("Key generation failed: ") + gcry_strerror(err));
             return;
         }
 
@@ -504,10 +448,28 @@ class COtrMod : public CModule {
     void SaveIgnores() {
         CString sFlat = CString(" ").Join(m_vsIgnored.begin(), m_vsIgnored.end());
         SetNV("ignore", sFlat, true);
+        if (m_vsEnabled.empty()) {
+            // A single space to avoid the default getting restored
+            sFlat = CString(" ");
+        } else {
+            sFlat = CString(" ").Join(m_vsEnabled.begin(), m_vsEnabled.end());
+        }
+        SetNV("enable", sFlat, true);
     }
 
     bool IsIgnored(const CString& sNick) {
         CString sNickLower = sNick.AsLower();
+
+        bool bEnabled = false;
+        for (const CString& s : m_vsEnabled) {
+            if (sNickLower.WildCmp(s)) {
+                bEnabled = true;
+                break;
+            }
+        }
+        if (!bEnabled) {
+            return true;
+        }
 
         for (const CString& s : m_vsIgnored) {
             if (sNickLower.WildCmp(s)) {
@@ -518,23 +480,32 @@ class COtrMod : public CModule {
     }
 
     void CmdIgnore(const CString& sLine) {
+        CString sEnDis;
+        VCString *pList;
+        if (sLine.Token(0) == "ignore") {
+            sEnDis = "disabled";
+            pList = &m_vsIgnored;
+        } else {
+            sEnDis = "enabled";
+            pList = &m_vsEnabled;
+        }
         if (sLine.Token(1).empty()) {
-            PutModuleBuffered("OTR is disabled for following nicks:");
-            for (const CString& s : m_vsIgnored) {
+            PutModuleBuffered(CString("OTR is ") + sEnDis + " for following nicks:");
+            for (const CString& s : *pList) {
                 PutModuleBuffered(s);
             }
         } else if (sLine.Token(1).Equals("--remove")) {
             CString sNick = sLine.Token(2);
             if (sNick.empty()) {
-                PutModuleBuffered("Usage: ignore --remove nick");
+                PutModuleBuffered("Usage: " + sLine.Token(0) + " --remove nick");
                 return;
             }
 
             bool bFound = false;
-            for (VCString::iterator it = m_vsIgnored.begin(); //range-based for
-                 it != m_vsIgnored.end(); it++) {
+            for (VCString::iterator it = pList->begin(); //range-based for
+                 it != pList->end(); it++) {
                 if (it->Equals(sNick)) {
-                    m_vsIgnored.erase(it);
+                    pList->erase(it);
                     bFound = true;
                     break;
                 }
@@ -542,27 +513,23 @@ class COtrMod : public CModule {
 
             if (bFound) {
                 SaveIgnores();
-                PutModuleBuffered("Removed " + Clr(Bold, sNick) +
-                                  " from OTR ignore list.");
+                PutModuleBuffered("Removed " + Clr(Bold, sNick) + " from OTR " + sLine.Token(0) + " list.");
             } else {
-                PutModuleBuffered("Not on OTR ignore list: " + sNick);
+                PutModuleBuffered("Not on OTR " + sLine.Token(0) + " list: " + sNick);
             }
         } else {
             CString sNick = sLine.Token(1).MakeLower();
-            m_vsIgnored.push_back(sNick);
+            pList->push_back(sNick);
             SaveIgnores();
-            PutModuleBuffered("Added " + Clr(Bold, sNick) +
-                              " to OTR ignore list.");
+            PutModuleBuffered("Added " + Clr(Bold, sNick) + " to OTR " + sLine.Token(0) + " list.");
         }
     }
 
     bool OnLoad(const CString& sArgs, CString& sMessage) override {
         // Initialize libgcrypt for multithreaded usage
-        gcry_error_t err = gcry_control(GCRYCTL_SET_THREAD_CBS,
-                                        &gcry_threads_pthread);
+        gcry_error_t err = gcry_control(GCRYCTL_SET_THREAD_CBS, &gcry_threads_pthread);
         if (err) {
-            sMessage = (CString("Failed to initialize gcrypt threading: ") +
-                        gcry_strerror(err));
+            sMessage = (CString("Failed to initialize gcrypt threading: ") + gcry_strerror(err));
             return false;
         }
 
@@ -586,95 +553,63 @@ class COtrMod : public CModule {
         // Load private key
         err = otrl_privkey_read(m_pUserState, m_sPrivkeyPath.c_str());
         if (gcry_err_code(err) == GPG_ERR_NO_ERROR) {
-            // PutModuleBuffered("Private keys loaded from " + m_sPrivkeyPath +
-            // ".");
+            //PutModuleBuffered("Private keys loaded from " + m_sPrivkeyPath + ".");
         } else if (gcry_err_code(err) == gcry_err_code_from_errno(ENOENT)) {
-            PutModuleBuffered("No private key found. Type " +
-                              Clr(Bold, "genkey") + " to generate new one.");
+            PutModuleBuffered("No private key found. Type " + Clr(Bold, "genkey") + " to generate new one.");
         } else {
-            sMessage = (CString("Failed to load private key: ") +
-                        gcry_strerror(err) + ".");
+            sMessage = (CString("Failed to load private key: ") + gcry_strerror(err) + ".");
             return false;
         }
-
         // Load fingerprints
-        err = otrl_privkey_read_fingerprints(m_pUserState, m_sFPPath.c_str(),
-                                             COtrAppData::Add, NULL);
+        err = otrl_privkey_read_fingerprints(m_pUserState, m_sFPPath.c_str(), COtrAppData::Add, NULL);
         if (gcry_err_code(err) == GPG_ERR_NO_ERROR) {
-            // PutModuleBuffered("Fingerprints loaded from " + m_sFPPath + ".");
+            //PutModuleBuffered("Fingerprints loaded from " + m_sFPPath + ".");
         } else if (gcry_err_code(err) == gcry_err_code_from_errno(ENOENT)) {
-            // PutModuleBuffered("No fingerprint file found.");
+            PutModuleBuffered("No fingerprint file found.");
         } else {
-            sMessage = (CString("Failed to load fingerprints: ") +
-                        gcry_strerror(err) + ".");
+            sMessage = (CString("Failed to load fingerprints: ") + gcry_strerror(err) + ".");
             return false;
         }
 
         //  Load instance tags
         err = otrl_instag_read(m_pUserState, m_sInsTagPath.c_str());
         if (gcry_err_code(err) == GPG_ERR_NO_ERROR) {
-            // PutModuleBuffered("Instance tags loaded from " + m_sInsTagPath +
-            // ".");
+            //PutModuleBuffered("Instance tags loaded from " + m_sInsTagPath + ".");
         } else if (gcry_err_code(err) == gcry_err_code_from_errno(ENOENT)) {
-            // PutModuleBuffered("No instance tag file found.");
+            PutModuleBuffered("No instance tag file found.");
         } else {
-            sMessage = (CString("Failed to load instance tags: ") +
-                        gcry_strerror(err) + ".");
+            sMessage = (CString("Failed to load instance tags: ") + gcry_strerror(err) + ".");
             return false;
         }
 
         // Initialize commands
         AddHelpCommand();
-        AddCommand("Info",
-                   static_cast<CModCommand::ModCmdFunc>(&COtrMod::CmdInfo), "",
-                   "List known fingerprints");
-        AddCommand(
-            "Trust", static_cast<CModCommand::ModCmdFunc>(&COtrMod::CmdTrust),
-            "<nick|fingerprint>",
-            "Mark the user's fingerprint as trusted after veryfing it over "
-            "secure channel.");
-        AddCommand("Distrust",
-                   static_cast<CModCommand::ModCmdFunc>(&COtrMod::CmdDistrust),
-                   "<nick|fingerprint>",
-                   "Mark user's fingerprint as not trusted.");
-        AddCommand("Finish",
-                   static_cast<CModCommand::ModCmdFunc>(&COtrMod::CmdFinish),
-                   "<nick>", "Terminate an OTR conversation.");
-        AddCommand("Auth",
-                   static_cast<CModCommand::ModCmdFunc>(&COtrMod::CmdAuth),
-                   "<nick> <secret>", "Authenticate using shared secret.");
-        AddCommand("AuthQ",
-                   static_cast<CModCommand::ModCmdFunc>(&COtrMod::CmdAuthQ),
-                   "<nick> <[question]> <secret>",
-                   "Authenticate using shared secret (providing a question).");
-        AddCommand("AuthAbort",
-                   static_cast<CModCommand::ModCmdFunc>(&COtrMod::CmdAuthAbort),
-                   "<nick>", "Abort authentication with peer.");
-        AddCommand("Ignore",
-                   static_cast<CModCommand::ModCmdFunc>(&COtrMod::CmdIgnore),
-                   "[--remove] [nick]",
-                   "Manage list of nicks excluded from OTR encryption. "
-                   "Accepts wildcards.");
-        AddCommand("GenKey",
-                   static_cast<CModCommand::ModCmdFunc>(&COtrMod::CmdGenKey),
-                   "[--really|--overwrite]", "Generate new private key.");
+        AddCommand("Info", static_cast<CModCommand::ModCmdFunc>(&COtrMod::CmdInfo), "", "List known fingerprints");
+        AddCommand("Trust", static_cast<CModCommand::ModCmdFunc>(&COtrMod::CmdTrust), "<nick|fingerprint>", "Mark the user's fingerprint as trusted after veryfing it over secure channel.");
+        AddCommand("Distrust", static_cast<CModCommand::ModCmdFunc>(&COtrMod::CmdDistrust), "<nick|fingerprint>", "Mark user's fingerprint as not trusted.");
+        AddCommand("Finish", static_cast<CModCommand::ModCmdFunc>(&COtrMod::CmdFinish), "<nick>", "Terminate an OTR conversation.");
+        AddCommand("Auth", static_cast<CModCommand::ModCmdFunc>(&COtrMod::CmdAuth), "<nick> <secret>", "Authenticate using shared secret.");
+        AddCommand("AuthQ", static_cast<CModCommand::ModCmdFunc>(&COtrMod::CmdAuthQ), "<nick> <[question]> <secret>", "Authenticate using shared secret (providing a question).");
+        AddCommand("AuthAbort", static_cast<CModCommand::ModCmdFunc>(&COtrMod::CmdAuthAbort), "<nick>", "Abort authentication with peer.");
+        AddCommand("Enable", static_cast<CModCommand::ModCmdFunc>(&COtrMod::CmdIgnore), "[--remove] [nick]", "Manage list of nicks enabled for OTR encryption. Accepts wildcards.");
+        AddCommand("Ignore", static_cast<CModCommand::ModCmdFunc>(&COtrMod::CmdIgnore), "[--remove] [nick]", "Manage list of nicks excluded from OTR encryption. Accepts wildcards.");
+        AddCommand("GenKey", static_cast<CModCommand::ModCmdFunc>(&COtrMod::CmdGenKey), "[--really|--overwrite]", "Generate new private key.");
 
         // Load list of ignored nicks
+        CString enabled_nicks = GetNV("enable");
+        if (enabled_nicks.empty()) {
+            // Default to enabled for all nicks
+            enabled_nicks = "*";
+        }
+        enabled_nicks.Split(" ", m_vsEnabled, false);
         GetNV("ignore").Split(" ", m_vsIgnored, false);
 
         // Warn if we are not an administrator - we should check if we are the
         // only administrator. However, the user map may not be fully populated
         // at this time.
         if (!GetUser()->IsAdmin()) {
-            PutModuleBuffered(
-                Clr(Red, "WARNING:") +
-                " You are not a ZNC admin. "
-                "The ZNC administrator has access to your private keys "
-                "which can be used to read your encrypted messages and to "
-                "impersonate you.");
-            PutModuleBuffered(
-                "Do you trust their good intentions and the ability to "
-                "protect your data from other people?");
+            PutModuleBuffered(Clr(Red, "WARNING:") + " You are not a ZNC admin. The ZNC administrator has access to your private keys which can be used to read your encrypted messages and to impersonate you.");
+            PutModuleBuffered("Do you trust their good intentions and the ability to protect your data from other people?");
         }
 
         return true;
@@ -686,32 +621,26 @@ class COtrMod : public CModule {
         if (m_pUserState) otrl_userstate_free(m_pUserState);
     }
 
+    static CString FindOtrQuery(const CString& sMessage) {
+        //PutModuleBuffered("DEBUG(1): "+sMessage);
+        // Extract OTR query (e.g. ?OTR? or ?OTRv23?) from a message.
+        static const std::regex query{R"(\?OTR(\??v[a-z\d]*)?\?)"};
+        std::smatch m;
+        return std::regex_search(sMessage, m, query) ? m.str() : "";
+    }
+
     static void DefaultQueryWorkaround(CString& sMessage) {
+        //PutModuleBuffered("DEBUG(2): "+sMessage);
         /* libotr replaces ?OTR? request by a string that contains html tags and
-         * newlines.
-         * The newlines confuse IRC server, and if we sent them in a separate
-         * PRIVMSG then
-         * they would show up regardless of other side's otr plugin presnece,
-         * defeating
-         * the purpose of the message. We replace that message here, keeping the
-         * OTR tag.
+         * newlines. The newlines confuse IRC server, and if we sent them in a
+         * separate PRIVMSG then they would show up regardless of other side's
+         * otr plugin presnece, defeating the purpose of the message. We replace
+         * that message here, keeping the OTR query.
          */
-        CString sPattern =
-            "?OTR*\n<b>*</b> has requested an "
-            "<a href=\"http://otr.cypherpunks.ca/\">Off-the-Record "
-            "private conversation</a>.  However, you do not have a plugin "
-            "to support that.\nSee <a href=\"http://otr.cypherpunks.ca/\">"
-            "http://otr.cypherpunks.ca/</a> for more information.";
-
-        if (!sMessage.WildCmp(sPattern)) {
-            return;
+        const CString& query = FindOtrQuery(sMessage);
+        if (!query.empty()) {
+            sMessage = query + " Requesting an off-the-record private conversation. However, you do not have a plugin to support that. See https://otr.cypherpunks.ca/ for more information.";
         }
-
-        sMessage =
-            sMessage.FirstLine() +
-            " Requesting an off-the-record private "
-            "conversation. However, you do not have a plugin to support that. "
-            "See http://otr.cypherpunks.ca/ for more information.";
     }
 
     bool TargetIsChan(const CString& sTarget) {
@@ -721,28 +650,23 @@ class COtrMod : public CModule {
         if (sTarget.empty()) {
             return true;
         } else if (network->GetChanPrefixes().empty()) {
-            // RFC 2811
             return (CString("&#!+").find(sTarget[0]) != CString::npos);
         } else {
-            return (network->GetChanPrefixes().find(sTarget[0]) !=
-                    CString::npos);
+            return (network->GetChanPrefixes().find(sTarget[0]) != CString::npos);
         }
     }
 
     EModRet SendEncrypted(CString& sTarget, CString& sMessage) {
+        //PutModuleBuffered("DEBUG(3): "+sMessage);
         gcry_error_t err;
         char* newmessage = NULL;
         const char* accountname = GetUser()->GetUserName().c_str();
         CString sNick = sTarget.AsLower();
 
-        err = otrl_message_sending(
-            m_pUserState, &m_xOtrOps, this, accountname, PROTOCOL_ID,
-            sNick.c_str(), OTRL_INSTAG_BEST, sMessage.c_str(), NULL,
-            &newmessage, OTRL_FRAGMENT_SEND_ALL, NULL, COtrAppData::Add, NULL);
+        err = otrl_message_sending(m_pUserState, &m_xOtrOps, this, accountname, PROTOCOL_ID, sNick.c_str(), OTRL_INSTAG_BEST, sMessage.c_str(), NULL, &newmessage, OTRL_FRAGMENT_SEND_ALL, NULL, COtrAppData::Add, NULL);
 
         if (err) {
-            PutModuleBuffered(CString("otrl_message_sending failed: ") +
-                              gcry_strerror(err));
+            PutModuleBuffered(CString("otrl_message_sending failed: ") + gcry_strerror(err));
             return HALT;
         }
 
@@ -757,6 +681,7 @@ class COtrMod : public CModule {
     }
 
     EModRet OnUserMsg(CString& sTarget, CString& sMessage) override {
+        //PutModuleBuffered("DEBUG(4): "+sMessage);
         // Do not pass the message to libotr if sTarget is a channel
         if (TargetIsChan(sTarget) || IsIgnored(sTarget)) {
             return CONTINUE;
@@ -766,6 +691,7 @@ class COtrMod : public CModule {
     }
 
     EModRet OnUserAction(CString& sTarget, CString& sMessage) override {
+        //PutModuleBuffered("DEBUG(5): "+sMessage);
         if (TargetIsChan(sTarget) || IsIgnored(sTarget)) {
             return CONTINUE;
         }
@@ -781,7 +707,12 @@ class COtrMod : public CModule {
         return SendEncrypted(sTarget, sLine);
     }
 
+    static bool HasOtrMessageEnd(const CString& sMessage) {
+        return sMessage.EndsWith(".") || sMessage.EndsWith(",");
+    }
+
     EModRet OnPrivMsg(CNick& Nick, CString& sMessage) override {
+        //PutModuleBuffered("DEBUG(6): "+sMessage);
         int res;
         char* newmessage = NULL;
         OtrlTLV* tlvs = NULL;
@@ -792,53 +723,67 @@ class COtrMod : public CModule {
             return CONTINUE;
         }
 
-        const char* accountname = GetUser()->GetUserName().c_str();
-        res = otrl_message_receiving(m_pUserState, &m_xOtrOps, this,
-                                     accountname, PROTOCOL_ID, sNick.c_str(),
-                                     sMessage.c_str(), &newmessage, &tlvs, &ctx,
-                                     COtrAppData::Add, NULL);
+        // When using an XMPP to IRC gateway such as bitlbee, a single OTR
+        // message can get broken into multiple parts due to IRC message length
+        // limit. Buffer such parts until a whole OTR message is received, and
+        // only then pass it to libotr.
+        if (sMessage.StartsWith("?OTR")) {
+            if (!HasOtrMessageEnd(sMessage) && FindOtrQuery(sMessage).empty()) {
+                // received beginning of an incomplete OTR message (not a query);
+                // buffer it (replacing any existing data) and wait for rest
+                m_MessageBuffer[sNick] = sMessage;
+                return HALT;
+            }
+        } else {
+            auto buffer = m_MessageBuffer.find(sNick);
+            if (buffer != m_MessageBuffer.end()) {
+                // received the next part of a buffered OTR message
+                if (!HasOtrMessageEnd(sMessage)) {
+                    // OTR message still incomplete, add new data to buffer
+                    buffer->second += sMessage;
+                    return HALT;
+                } else {
+                    // this part completes a buffered OTR message
+                    sMessage = buffer->second + sMessage;
+                    m_MessageBuffer.erase(buffer);
+                }
+            }
+        }
 
+        const char* accountname = GetUser()->GetUserName().c_str();
+        res = otrl_message_receiving(m_pUserState, &m_xOtrOps, this, accountname, PROTOCOL_ID, sNick.c_str(), sMessage.c_str(), &newmessage, &tlvs, &ctx, COtrAppData::Add, NULL);
         if (ctx && otrl_tlv_find(tlvs, OTRL_TLV_DISCONNECTED)) {
-            PutModuleContext(
-                ctx,
-                "Peer has finished the conversation. "
-                "Type " +
-                    Clr(Bold, "finish " + Nick.GetNick()) +
-                    " to enter plaintext mode, or send ?OTR? to start "
-                    "new OTR session.");
+            PutModuleContext(ctx, "Peer has finished the conversation. Type " + Clr(Bold, "finish " + Nick.GetNick()) + " to enter plaintext mode, or send ?OTR? to start new OTR session.");
         }
         if (tlvs) {
             otrl_tlv_free(tlvs);
         }
 
         if (res == 1) {
-            // PutModule("Received internal OTR message");
+            //PutModule("Received internal OTR message");
             return HALT;
         } else if (res != 0) {
-            PutModuleBuffered(
-                CString("otrl_message_receiving: unknown return code ") +
-                CString(res));
+            PutModuleBuffered(CString("otrl_message_receiving: unknown return code ") + CString(res));
             return HALT;
         } else if (newmessage == NULL) {
-            // PutModule("Received non-encrypted privmsg");
+            //PutModule("Received non-encrypted privmsg");
             return CONTINUE;
         } else {
-            // PutModule("Received encrypted privmsg");
+            //PutModule("Received encrypted privmsg");
             sMessage = CString(newmessage);
             otrl_message_free(newmessage);
-
+            sMessage = sMessage + " \x03" + "07" + "\x02" + "\xB7" + "\x02" + "\x03";
             // Handle /me as sent by irssi and weechat plugins
             if (sMessage.TrimPrefix("/me ")) {
                 sMessage = "\001ACTION " + sMessage + "\001";
             }
-
+            
             return CONTINUE;
         }
     }
 
     void OnClientLogin() override {
-        for (list<CString>::iterator it = m_Buffer.begin();
-             it != m_Buffer.end(); it++) {
+        for (list<CString>::iterator it = m_Buffer.begin(); it != m_Buffer.end(); it++) {
             PutModule(*it);
         }
         m_Buffer.clear();
@@ -851,27 +796,20 @@ class COtrMod : public CModule {
         return OTRL_POLICY_DEFAULT;
     }
 
-    static void otrCreatePrivkey(void* opdata, const char* accountname,
-                                 const char* protocol) {
+    static void otrCreatePrivkey(void* opdata, const char* accountname, const char* protocol) {
         COtrMod* mod = static_cast<COtrMod*>(opdata);
         assert(mod);
         assert(0 == strcmp(protocol, PROTOCOL_ID));
 
-        mod->PutModuleBuffered(
-            "Someone wants to start an OTR session but you don't have a "
-            "key available. Type " + mod->Clr(Bold, "genkey") +
-            " to generate new one.");
+        mod->PutModuleBuffered("Someone wants to start an OTR session but you don't have a key available. Type " + mod->Clr(Bold, "genkey") + " to generate new one.");
     }
 
-    static int otrIsLoggedIn(void* opdata, const char* accountname,
-                             const char* protocol, const char* recipient) {
+    static int otrIsLoggedIn(void* opdata, const char* accountname, const char* protocol, const char* recipient) {
         // Assume always online, otrl_message_disconnect does nothing otherwise.
         return 1;
     }
 
-    static void otrInjectMessage(void* opdata, const char* accountname,
-                                 const char* protocol, const char* recipient,
-                                 const char* message) {
+    static void otrInjectMessage(void* opdata, const char* accountname, const char* protocol, const char* recipient, const char* message) {
         COtrMod* mod = static_cast<COtrMod*>(opdata);
         assert(mod);
         assert(0 == strcmp(protocol, PROTOCOL_ID));
@@ -888,6 +826,7 @@ class COtrMod : public CModule {
         }
 
         mod->PutIRC(CString("PRIVMSG ") + recipient + " :" + sMessage);
+        //PutModuleBuffered("DEBUG(7): "+sMessage);
     }
 
     static void otrWriteFingerprints(void* opdata) {
@@ -899,38 +838,17 @@ class COtrMod : public CModule {
     static void otrGoneSecure(void* opdata, ConnContext* context) {
         COtrMod* mod = static_cast<COtrMod*>(opdata);
         assert(mod);
-        mod->PutModuleContext(
-            context, "Gone " + mod->Clr(Bold, "SECURE") +
-                         ". Please "
-                         "make sure logging is turned off on your IRC client.");
+        mod->PutModuleContext(context, "Gone " + mod->Clr(Bold, "SECURE") + ". Please make sure logging is turned off on your IRC client.");
 
         mod->WarnIfLoggingEnabled();
 
         assert(context->active_fingerprint);
         if (!otrl_context_is_fingerprint_trusted(context->active_fingerprint)) {
-            mod->PutModuleContext(context,
-                                  "Peer is not authenticated. There are two "
-                                  "ways of verifying their identity:");
-            mod->PutModuleContext(
-                context,
-                "1. Agree on a common secret (do not type "
-                "it into the chat), then type " +
-                    mod->Clr(Bold, CString("auth ") + context->username +
-                                       " <secret>") +
-                    ".");
-            mod->PutModuleContext(
-                context,
-                "2. Compare their fingerprint over a "
-                "secure channel, then type " +
-                    mod->Clr(Bold, CString("trust ") + context->username) +
-                    ".");
-            mod->PutModuleContext(
-                context,
-                "Your fingerprint:  " + mod->Clr(Bold, mod->OurFingerprint()));
-            mod->PutModuleContext(
-                context, "Their fingerprint: " +
-                             mod->Clr(Bold, HumanFingerprint(
-                                                context->active_fingerprint)));
+            mod->PutModuleContext(context, "Peer is not authenticated. There are two ways of verifying their identity:");
+            mod->PutModuleContext(context, "1. Agree on a common secret (do not type it into the chat), then type " + mod->Clr(Bold, CString("auth ") + context->username + " <secret>") + ".");
+            mod->PutModuleContext(context, "2. Compare their fingerprint over a secure channel, then type " + mod->Clr(Bold, CString("trust ") + context->username) + ".");
+            mod->PutModuleContext(context, "Your fingerprint:  " + mod->Clr(Bold, mod->OurFingerprint()));
+            mod->PutModuleContext(context, "Their fingerprint: " + mod->Clr(Bold, HumanFingerprint(context->active_fingerprint)));
         }
     }
 
@@ -938,17 +856,13 @@ class COtrMod : public CModule {
         /* This callback doesn't seem to be used by libotr-4.0.0. */
         COtrMod* mod = static_cast<COtrMod*>(opdata);
         assert(mod);
-        mod->PutModuleContext(context,
-                              "Gone " + mod->Clr(Bold, "INSECURE") + ".");
+        mod->PutModuleContext(context, "Gone " + mod->Clr(Bold, "INSECURE") + ".");
     }
 
-    static void otrStillSecure(void* opdata, ConnContext* context,
-                               int is_reply) {
+    static void otrStillSecure(void* opdata, ConnContext* context, int is_reply) {
         COtrMod* mod = static_cast<COtrMod*>(opdata);
         assert(mod);
-        mod->PutModuleContext(context, "Still " + mod->Clr(Bold, "SECURE") +
-                                           " (restarted by " +
-                                           (is_reply ? "peer" : "us") + ").");
+        mod->PutModuleContext(context, "Still " + mod->Clr(Bold, "SECURE") + " (restarted by " + (is_reply ? "peer" : "us") + ").");
     }
 
     static int otrMaxMessageSize(void* opdata, ConnContext* context) {
@@ -964,22 +878,17 @@ class COtrMod : public CModule {
 
     static void otrFreeStringNop(void* opdata, const char* str) {}
 
-    static void otrReceiveSymkey(void* opdata, ConnContext* context,
-                                 unsigned int use, const unsigned char* usedata,
-                                 size_t usedatalen,
-                                 const unsigned char* symkey) {
+    static void otrReceiveSymkey(void* opdata, ConnContext* context, unsigned int use, const unsigned char* usedata, size_t usedatalen, const unsigned char* symkey) {
         /* We don't have any use for a symmetric key. */
         return;
     }
 
-    static const char* otrErrorMessage(void* opdata, ConnContext* context,
-                                       OtrlErrorCode err_code) {
+    static const char* otrErrorMessage(void* opdata, ConnContext* context, OtrlErrorCode err_code) {
         switch (err_code) {
             case OTRL_ERRCODE_ENCRYPTION_ERROR:
                 return "Error encrypting message.";
             case OTRL_ERRCODE_MSG_NOT_IN_PRIVATE:
-                return "Sent an encrypted message to somebody who is not in "
-                       "OTR session.";
+                return "Sent an encrypted message to somebody who is not in OTR session.";
             case OTRL_ERRCODE_MSG_UNREADABLE:
                 return "Sent an unreadable encrypted message.";
             case OTRL_ERRCODE_MSG_MALFORMED:
@@ -989,10 +898,7 @@ class COtrMod : public CModule {
         }
     }
 
-    static void otrHandleSMPEvent(void* opdata, OtrlSMPEvent smp_event,
-                                  ConnContext* context,
-                                  unsigned short progress_percent,
-                                  char* question) {
+    static void otrHandleSMPEvent(void* opdata, OtrlSMPEvent smp_event, ConnContext* context, unsigned short progress_percent, char* question) {
         COtrMod* mod = static_cast<COtrMod*>(opdata);
         assert(mod);
 
@@ -1003,26 +909,17 @@ class COtrMod : public CModule {
         switch (smp_event) {
             case OTRL_SMPEVENT_ASK_FOR_ANSWER:
                 assert(question);
-                mod->PutModuleContext(
-                    context,
-                    "Peer wants to authenticate. To complete, "
-                    "answer the following question:");
+                mod->PutModuleContext(context, "Peer wants to authenticate. To complete, answer the following question:");
                 mod->PutModuleContext(context, question);
-                mod->PutModuleContext(context,
-                                      CString("Answer by typing auth ") +
-                                          context->username + " <answer>.");
+                mod->PutModuleContext(context, CString("Answer by typing auth ") + context->username + " <answer>.");
                 ad->bSmpReply = true;
                 break;
             case OTRL_SMPEVENT_ASK_FOR_SECRET:
-                mod->PutModuleContext(context,
-                                      CString("Peer wants to authenticate. To "
-                                              "complete, type auth ") +
-                                          context->username + " <secret>.");
+                mod->PutModuleContext(context, CString("Peer wants to authenticate. To complete, type auth ") + context->username + " <secret>.");
                 ad->bSmpReply = true;
                 break;
             case OTRL_SMPEVENT_IN_PROGRESS:
-                mod->PutModuleContext(
-                    context, "Peer replied to authentication request.");
+                mod->PutModuleContext(context, "Peer replied to authentication request.");
                 break;
             case OTRL_SMPEVENT_SUCCESS:
                 mod->PutModuleContext(context, "Successfully authenticated.");
@@ -1035,8 +932,7 @@ class COtrMod : public CModule {
             case OTRL_SMPEVENT_CHEATED:
                 mod->PutModuleContext(context, "Authentication failed.");
                 if (smp_event != OTRL_SMPEVENT_FAILURE) {
-                    otrl_message_abort_smp(mod->m_pUserState, &mod->m_xOtrOps,
-                                           opdata, context);
+                    otrl_message_abort_smp(mod->m_pUserState, &mod->m_xOtrOps, opdata, context);
                 }
                 break;
             default:
@@ -1045,9 +941,7 @@ class COtrMod : public CModule {
         }
     }
 
-    static void otrHandleMsgEvent(void* opdata, OtrlMessageEvent msg_event,
-                                  ConnContext* ctx, const char* message,
-                                  gcry_error_t err) {
+    static void otrHandleMsgEvent(void* opdata, OtrlMessageEvent msg_event, ConnContext* ctx, const char* message, gcry_error_t err) {
         COtrMod* mod = static_cast<COtrMod*>(opdata);
         assert(mod);
 
@@ -1056,33 +950,16 @@ class COtrMod : public CModule {
 
         switch (msg_event) {
             case OTRL_MSGEVENT_ENCRYPTION_REQUIRED:
-                mod->PutModuleContext(
-                    ctx,
-                    "Our policy requires encryption but we are trying "
-                    "to send an unencrypted message out.");
+                mod->PutModuleContext(ctx, "Our policy requires encryption but we are trying to send an unencrypted message out.");
                 break;
             case OTRL_MSGEVENT_ENCRYPTION_ERROR:
-                mod->PutModuleContext(
-                    ctx,
-                    "An error occured while encrypting a message and "
-                    "the message was not sent.");
+                mod->PutModuleContext(ctx, "An error occured while encrypting a message and the message was not sent.");
                 break;
             case OTRL_MSGEVENT_CONNECTION_ENDED:
-                mod->PutModuleContext(
-                    ctx,
-                    "Message has not been sent because our peer has "
-                    "ended the private conversation. You should either close "
-                    "the "
-                    "connection (by typing " +
-                        mod->Clr(Bold, CString("finish ") + ctx->username) +
-                        "), " + "or restart it by sending them " +
-                        mod->Clr(Bold, "?OTR?") + ".");
+                mod->PutModuleContext(ctx, "Message has not been sent because our peer has ended the private conversation. You should either close the connection (by typing " + mod->Clr(Bold, CString("finish ") + ctx->username) + "), " + "or restart it by sending them " + mod->Clr(Bold, "?OTR?") + ".");
                 break;
             case OTRL_MSGEVENT_SETUP_ERROR:
-                mod->PutModuleContext(
-                    ctx,
-                    CString("A private conversation could not be set up: ") +
-                        gcry_strerror(err));
+                mod->PutModuleContext(ctx, CString("A private conversation could not be set up: ") + gcry_strerror(err));
                 break;
             case OTRL_MSGEVENT_MSG_REFLECTED:
                 mod->PutModuleContext(ctx, "Received our own OTR messages.");
@@ -1091,46 +968,32 @@ class COtrMod : public CModule {
                 mod->PutModuleContext(ctx, "The previous message was resent.");
                 break;
             case OTRL_MSGEVENT_RCVDMSG_NOT_IN_PRIVATE:
-                mod->PutModuleContext(
-                    ctx,
-                    "Received an encrypted message but cannot read it "
-                    "because no private connection is established yet.");
+                mod->PutModuleContext(ctx, "Received an encrypted message but cannot read it because no private connection is established yet.");
                 break;
             case OTRL_MSGEVENT_RCVDMSG_UNREADABLE:
                 mod->PutModuleContext(ctx, "Cannot read the received message.");
                 break;
             case OTRL_MSGEVENT_RCVDMSG_MALFORMED:
-                mod->PutModuleContext(
-                    ctx, "The message received contains malformed data.");
+                mod->PutModuleContext(ctx, "The message received contains malformed data.");
                 break;
             case OTRL_MSGEVENT_LOG_HEARTBEAT_RCVD:
-                // mod->PutModuleContext(ctx, "Received a heartbeat.");
+                //mod->PutModuleContext(ctx, "Received a heartbeat.");
                 break;
             case OTRL_MSGEVENT_LOG_HEARTBEAT_SENT:
-                // mod->PutModuleContext(ctx, "Sent a heartbeat.");
+                //mod->PutModuleContext(ctx, "Sent a heartbeat.");
                 break;
             case OTRL_MSGEVENT_RCVDMSG_GENERAL_ERR:
-                mod->PutModuleContext(
-                    ctx, CString("Received a general OTR error: ") + message);
+                mod->PutModuleContext(ctx, CString("Received a general OTR error: ") + message);
                 break;
             case OTRL_MSGEVENT_RCVDMSG_UNENCRYPTED:
-                mod->PutModuleContext(
-                    ctx,
-                    CString("Received an unencrypted message: ") + message);
-                mod->PutUser(CString(":") + ctx->username + " PRIVMSG " + sTo +
-                             " :" + sWarn + " " + message);
+                mod->PutModuleContext(ctx, CString("Received an unencrypted message: ") + message);
+                mod->PutUser(CString(":") + ctx->username + " PRIVMSG " + sTo + " :" + sWarn + " " + message);
                 break;
             case OTRL_MSGEVENT_RCVDMSG_UNRECOGNIZED:
-                mod->PutModuleContext(
-                    ctx,
-                    "Cannot recognize the type of OTR message "
-                    "received.");
+                mod->PutModuleContext(ctx, "Cannot recognize the type of OTR message received.");
                 break;
             case OTRL_MSGEVENT_RCVDMSG_FOR_OTHER_INSTANCE:
-                mod->PutModuleContext(
-                    ctx,
-                    "Received and discarded a message intended for "
-                    "another instance.");
+                mod->PutModuleContext(ctx, "Received and discarded a message intended for another instance.");
                 break;
             default:
                 mod->PutModuleContext(ctx, "Unknown message event.");
@@ -1138,8 +1001,7 @@ class COtrMod : public CModule {
         }
     }
 
-    static void otrCreateInsTag(void* opdata, const char* accountname,
-                                const char* protocol) {
+    static void otrCreateInsTag(void* opdata, const char* accountname, const char* protocol) {
         COtrMod* mod = static_cast<COtrMod*>(opdata);
         assert(mod);
         assert(!mod->m_sInsTagPath.empty());
@@ -1147,8 +1009,7 @@ class COtrMod : public CModule {
         OtrlUserState us = mod->m_pUserState;
         assert(us);
 
-        otrl_instag_generate(us, mod->m_sInsTagPath.c_str(), accountname,
-                             protocol);
+        otrl_instag_generate(us, mod->m_sInsTagPath.c_str(), accountname, protocol);
     }
 
     static void otrTimerControl(void* opdata, unsigned int interval) {
@@ -1171,14 +1032,11 @@ class COtrMod : public CModule {
                 // Create new timer
                 mod->m_pOtrTimer = new COtrTimer(mod, interval);
                 if (!mod->AddTimer(mod->m_pOtrTimer)) {
-                    mod->PutModuleBuffered(
-                        "Error: failed to create timer, "
-                        "forward secrecy not guaranteed.");
+                    mod->PutModuleBuffered("Error: failed to create timer, forward secrecy not guaranteed.");
                 }
             } else {
                 // Should never happen?
-                mod->PutModuleBuffered(
-                    "Error: trying to delete nonexistent timer.");
+                mod->PutModuleBuffered("Error: trying to delete nonexistent timer.");
             }
         }
     }
@@ -1220,8 +1078,7 @@ void TModInfo<COtrMod>(CModInfo& Info) {
     // Info.SetArgsHelpText("No args.");
 }
 
-NETWORKMODULEDEFS(COtrMod,
-                  "Off-the-Record (OTR) encryption for private messages")
+NETWORKMODULEDEFS(COtrMod, "Off-the-Record (OTR) encryption for private messages")
 
 void COtrTimer::RunJob() {
     COtrMod* mod = static_cast<COtrMod*>(m_pModule);
@@ -1243,12 +1100,10 @@ void COtrGenKeyJob::runMain() {
     assert(!mod->m_sPrivkeyPath.empty());
 
     if (!mod->m_GenKeyError) {
-        mod->m_GenKeyError = otrl_privkey_generate_finish(
-            mod->m_pUserState, mod->m_NewKey, mod->m_sPrivkeyPath.c_str());
+        mod->m_GenKeyError = otrl_privkey_generate_finish(mod->m_pUserState, mod->m_NewKey, mod->m_sPrivkeyPath.c_str());
     }
     if (mod->m_GenKeyError) {
-        mod->PutModuleBuffered(CString("Key generation failed: ") +
-                               gcry_strerror(mod->m_GenKeyError));
+        mod->PutModuleBuffered(CString("Key generation failed: ") + gcry_strerror(mod->m_GenKeyError));
     } else {
         mod->PutModuleBuffered("Key generation finished.");
     }
