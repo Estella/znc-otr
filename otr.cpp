@@ -686,8 +686,8 @@ class COtrMod : public CModule {
         if (TargetIsChan(sTarget) || IsIgnored(sTarget)) {
             return CONTINUE;
         }
-
-        return SendEncrypted(sTarget, sMessage);
+        sMessage.Trim();
+        return SendEncrypted(sTarget, sMessage); // TRIM
     }
 
     EModRet OnUserAction(CString& sTarget, CString& sMessage) override {
@@ -704,7 +704,8 @@ class COtrMod : public CModule {
 
         // Try sending the formatted line. If CONTINUE is returned,
         // pass unformatted to other plugins/caller.
-        return SendEncrypted(sTarget, sLine);
+        sLine.Trim();
+        return SendEncrypted(sTarget, sLine); // TRIM
     }
 
     static bool HasOtrMessageEnd(const CString& sMessage) {
@@ -777,7 +778,7 @@ class COtrMod : public CModule {
             if (sMessage.TrimPrefix("/me ")) {
                 sMessage = "\001ACTION " + sMessage + "\001";
             }
-            
+            sMessage.Trim(); // TRIM
             return CONTINUE;
         }
     }
@@ -822,10 +823,11 @@ class COtrMod : public CModule {
 
         CString sMessage(message);
         if (!mod->TargetIsChan(CString(recipient))) {
-            DefaultQueryWorkaround(sMessage);
+            sMessage.Trim();
+            DefaultQueryWorkaround(sMessage); // TRIM
         }
-
-        mod->PutIRC(CString("PRIVMSG ") + recipient + " :" + sMessage);
+        sMessage.Trim();
+        mod->PutIRC(CString("PRIVMSG ") + recipient + " :" + sMessage); // TRIM
         //PutModuleBuffered("DEBUG(7): "+sMessage);
     }
 
